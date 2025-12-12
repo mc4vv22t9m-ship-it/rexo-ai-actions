@@ -1,0 +1,39 @@
+openapi: 3.0.3
+info:
+  title: Rexo AI Actions
+  version: 1.0.0
+servers:
+  - url: https://rexo-ai-actions-production.up.railway.app
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /rexo:
+    post:
+      operationId: rexo
+      summary: REXO action endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
