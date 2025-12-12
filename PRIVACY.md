@@ -1,9 +1,27 @@
 # Privacy Policy
 
-This service processes data only for the purpose of executing requested actions.
+Last updated: December 2025
 
-No personal data is stored, shared, or sold.
+Rexo AI (“we”, “our”, “us”) provides an AI-powered Fantasy Premier League assistant.
 
-Requests are processed transiently and discarded after completion.
+## Data Collection
+Rexo AI does not store personal data.
+All inputs are processed in real time and are not persisted.
 
-If you have questions, contact the repository owner.
+## Usage Data
+We may process:
+- Squad information
+- Gameweek preferences
+- Strategy-related inputs
+
+This data is used solely to generate recommendations and is not retained.
+
+## Third-Party Services
+Rexo AI may rely on official Fantasy Premier League data sources and publicly available football statistics.
+
+## Security
+We take reasonable measures to protect data processed during usage.
+
+## Contact
+For questions regarding this policy:
+support@rexo.ai
