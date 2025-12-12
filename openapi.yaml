@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Rexo AI Actions
-  version: "1.0.0"
-
+  title: REXO Actions (Elite)
+  version: 1.0.0
+  description: Single action endpoint that returns live FPL context + dataset bundle for Elite decisions.
 servers:
   - url: https://rexo-ai-actions-production.up.railway.app
 
@@ -18,24 +18,136 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                properties:
+                  ok:
+                    type: boolean
+                required: [ok]
 
   /rexo:
     post:
       operationId: rexo
-      summary: REXO action endpoint
+      summary: Fetch live season context + data bundle for Elite FPL decisions
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              additionalProperties: true
+              properties:
+                intent:
+                  type: string
+                  description: What the user wants to do.
+                  enum:
+                    - squad_review
+                    - transfers
+                    - captaincy
+                    - lineup
+                    - chip_strategy
+                    - price_watch
+                    - wildcard_draft
+                    - general
+                squad:
+                  type: object
+                  description: Optional user squad context (use if available).
+                  properties:
+                    players:
+                      type: array
+                      description: 15 player IDs (FPL element IDs) if known.
+                      items:
+                        type: integer
+                    itb:
+                      type: number
+                      description: Money in the bank
+                    free_transfers:
+                      type: integer
+                    chips_available:
+                      type: array
+                      items:
+                        type: string
+                    target_gw:
+                      type: integer
+                  additionalProperties: false
+                players_of_interest:
+                  type: array
+                  description: Optional list of FPL element IDs to enrich with per-player data (summary).
+                  items:
+                    type: integer
+                horizon_gws:
+                  type: integer
+                  description: How many upcoming GWs to include in fixtures slice.
+                  minimum: 1
+                  maximum: 12
+                  default: 6
+              required: [intent]
+              additionalProperties: false
       responses:
         "200":
-          description: OK
+          description: Live season context + data bundle
           content:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                properties:
+                  ok:
+                    type: boolean
+
+                  meta:
+                    type: object
+                    description: Authoritative live context. MUST be present for Elite to answer.
+                    properties:
+                      active_season:
+                        type: string
+                        description: e.g. "2025/26"
+                      current_gw:
+                        type: integer
+                      next_deadline_utc:
+                        type: string
+                        format: date-time
+                      data_timestamp_utc:
+                        type: string
+                        format: date-time
+                      source:
+                        type: string
+                        description: Source label, e.g. "official_fpl"
+                    required: [active_season, current_gw, next_deadline_utc, data_timestamp_utc]
+
+                  fpl:
+                    type: object
+                    description: Core FPL dataset bundle used by Elite.
+                    properties:
+                      bootstrap:
+                        type: object
+                        description: Official FPL bootstrap-static payload (or a reduced subset).
+                      fixtures:
+                        type: array
+                        description: Upcoming fixtures slice (size depends on horizon_gws).
+                        items:
+                          type: object
+                      event_status:
+                        type: object
+                        description: Official FPL event-status payload.
+                      element_summaries:
+                        type: object
+                        description: Map of elementId -> official element-summary payload (only for players_of_interest).
+                        additionalProperties:
+                          type: object
+                    required: [bootstrap, fixtures, event_status]
+
+                  warnings:
+                    type: array
+                    items:
+                      type: string
+
+                required: [ok, meta, fpl]
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                required: [ok, error]
