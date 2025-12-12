@@ -1,26 +1,17 @@
 import express from "express";
 
 const app = express();
-
-// middleware za JSON
 app.use(express.json());
 
-// health check
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-// REXO ACTION ENDPOINT
-app.post("/rexo", async (req, res) => {
-  return res.json({
-    ok: true,
-    received: req.body,
-  });
+app.post("/rexo", (req, res) => {
+  return res.json({ ok: true, received: req.body });
 });
 
-// Railway port
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
