@@ -70,13 +70,99 @@ function buildMeta(bootstrap) {
   };
 }
 
-function posMap() {
-  return new Map([
-    [1, "GK"],
-    [2, "DEF"],
-    [3, "MID"],
-    [4, "FWD"]
-  ]);
+/** ---------- HARD GATE HELPERS ---------- **/
+const POS_NAME = new Map([
+  [1, "GK"],
+  [2, "DEF"],
+  [3, "MID"],
+  [4, "FWD"]
+]);
+
+function normalize(str) {
+  return (str || "")
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function buildTeamMaps(teams) {
+  const byId = new Map();
+  const shortById = new Map();
+  const nameById = new Map();
+
+  for (const t of teams || []) {
+    byId.set(t.id, t);
+    shortById.set(t.id, t.short_name || t.name || String(t.id));
+    nameById.set(t.id, t.name || t.short_name || String(t.id));
+  }
+  return { byId, shortById, nameById };
+}
+
+/**
+ * Strict player resolution: only from current bootstrap.elements
+ * q can be: "Bowen" or "Jarrod Bowen – West Ham" etc.
+ */
+function resolvePlayerStrict({ q, elements, teams }) {
+  const nq = normalize(q);
+  if (!nq) return { ok: false, error: "EMPTY_QUERY" };
+
+  const { shortById, nameById } = buildTeamMaps(teams);
+
+  // Match by web_name first (most stable), then by first+second name contains.
+  const hits = (elements || [])
+    .filter((e) => e && e.web_name)
+    .filter((e) => normalize(e.web_name) === nq || normalize(e.web_name).includes(nq))
+    .slice(0, 10);
+
+  // If zero hits, try broader contains on "first_name last_name"
+  const hits2 = hits.length
+    ? hits
+    : (elements || [])
+        .filter((e) => e && (e.first_name || e.second_name || e.web_name))
+        .filter((e) => {
+          const full = normalize(`${e.first_name || ""} ${e.second_name || ""}`.trim());
+          const web = normalize(e.web_name || "");
+          return full === nq || full.includes(nq) || web.includes(nq);
+        })
+        .slice(0, 10);
+
+  if (!hits2.length) return { ok: false, error: "NOT_FOUND" };
+
+  // Prefer exact match if exists
+  const exact = hits2.find((e) => normalize(e.web_name) === nq);
+  const chosen = exact || hits2[0];
+
+  // Ambiguity guard: if multiple very close hits and none exact, force clarification
+  if (!exact && hits2.length > 1) {
+    return {
+      ok: false,
+      error: "AMBIGUOUS",
+      candidates: hits2.slice(0, 5).map((e) => ({
+        id: e.id,
+        name: e.web_name,
+        team: shortById.get(e.team) || e.team
+      }))
+    };
+  }
+
+  return {
+    ok: true,
+    player: {
+      id: chosen.id,
+      name: chosen.web_name,
+      team: shortById.get(chosen.team) || chosen.team,
+      team_full: nameById.get(chosen.team) || chosen.team,
+      element_type: chosen.element_type,
+      position: POS_NAME.get(chosen.element_type) || chosen.element_type,
+      cost: chosen.now_cost,
+      status: chosen.status,
+      form: chosen.form,
+      selected_by_percent: chosen.selected_by_percent,
+      minutes: chosen.minutes,
+      chance_of_playing_next_round: chosen.chance_of_playing_next_round
+    }
+  };
 }
 
 /** Simple GW opponent strength adjustment (lightweight). */
@@ -258,9 +344,7 @@ app.post("/rexo", async (req, res) => {
 
     // common lookups
     const teams = bootstrap.teams || [];
-    const teamShortById = new Map(teams.map((t) => [t.id, t.short_name]));
-    const teamNameById = new Map(teams.map((t) => [t.id, t.name]));
-    const POS = posMap();
+    const { shortById: teamShortById, nameById: teamNameById } = buildTeamMaps(teams);
 
     if (mode === "meta") {
       return res.json({ ok: true, meta });
@@ -281,7 +365,7 @@ app.post("/rexo", async (req, res) => {
           team: teamShortById.get(e.team) || e.team,
           team_full: teamNameById.get(e.team) || e.team,
           element_type: e.element_type,
-          position: POS.get(e.element_type) || String(e.element_type),
+          position: POS_NAME.get(e.element_type) || String(e.element_type),
           cost: e.now_cost,
           form: e.form,
           selected_by_percent: e.selected_by_percent,
@@ -294,48 +378,39 @@ app.post("/rexo", async (req, res) => {
       return res.json({ ok: true, meta, result: { metric, limit, players: sorted } });
     }
 
-    // ✅ NEW: player_check (prevents position hallucinations)
+    // ✅ player_check (HARD-GATED) — single name only, returns validated_players
     if (mode === "player_check") {
-      const q = req.body?.q;
-      const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
-      const names = Array.isArray(req.body?.names) ? req.body.names.map(String) : [];
-      const limit = clamp(Number(req.body?.limit || 25), 1, 50);
-
-      const elements = bootstrap.elements || [];
-
-      const norm = (s) => String(s || "").trim().toLowerCase();
-      const qn = norm(q);
-
-      let hits = elements;
-
-      if (ids.length) {
-        const idSet = new Set(ids);
-        hits = hits.filter((e) => idSet.has(e.id));
-      } else if (names.length) {
-        const set = new Set(names.map(norm));
-        hits = hits.filter((e) => set.has(norm(e.web_name)));
-      } else if (q) {
-        hits = hits.filter((e) => norm(e.web_name).includes(qn));
-      } else {
-        hits = [];
+      // hard rule: do not accept batching
+      if (Array.isArray(req.body?.q)) {
+        return res.status(400).json({
+          ok: false,
+          error: "BATCH_PLAYER_CHECK_FORBIDDEN"
+        });
       }
 
-      hits = hits.slice(0, limit).map((e) => ({
-        id: e.id,
-        name: e.web_name,
-        team: teamShortById.get(e.team) || e.team,
-        team_full: teamNameById.get(e.team) || e.team,
-        element_type: e.element_type,
-        position: POS.get(e.element_type) || String(e.element_type),
-        cost: e.now_cost,
-        status: e.status,
-        form: e.form,
-        selected_by_percent: e.selected_by_percent,
-        minutes: e.minutes,
-        chance_of_playing_next_round: e.chance_of_playing_next_round
-      }));
+      const q = req.body?.q;
+      const limit = clamp(Number(req.body?.limit || 5), 1, 10);
 
-      return res.json({ ok: true, meta, result: { mode: "player_check", hits } });
+      const elements = bootstrap.elements || [];
+      const resolved = resolvePlayerStrict({ q, elements, teams });
+
+      // hard gate: no partials, no guesses
+      if (!resolved.ok) {
+        return res.status(400).json({
+          ok: false,
+          error: resolved.error,
+          ...(resolved.candidates ? { candidates: resolved.candidates } : {})
+        });
+      }
+
+      const validated_players = [resolved.player];
+
+      return res.json({
+        ok: true,
+        meta,
+        validated_players,
+        result: { mode: "player_check", hits: validated_players.slice(0, limit) }
+      });
     }
 
     if (mode === "fixtures") {
@@ -391,7 +466,7 @@ app.post("/rexo", async (req, res) => {
           team: teamShortById.get(e.team) || e.team,
           team_full: teamNameById.get(e.team) || e.team,
           element_type: e.element_type,
-          position: POS.get(e.element_type) || String(e.element_type),
+          position: POS_NAME.get(e.element_type) || String(e.element_type),
           cost: e.now_cost,
           form: e.form,
           ppg: e.points_per_game,
