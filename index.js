@@ -4,7 +4,9 @@ const app = express();
 app.use(express.json({ limit: "256kb" }));
 
 const FPL_BASE = "https://fantasy.premierleague.com/api";
-
+// ---------- BUILD FINGERPRINT (authoritative) ----------
+const BUILD_ID = "7a81130";
+const BUILD_TIME_UTC = new Date().toISOString();
 // ---------- tiny in-memory cache (prevents 502/timeouts) ----------
 const CACHE = {
   bootstrap: { ts: 0, data: null },
@@ -59,14 +61,23 @@ function buildMeta(bootstrap) {
     bootstrap.events.find((e) => e.is_next) ||
     null;
 
-  // FPL API often doesn’t expose season string reliably.
   return {
     competition: "Fantasy Premier League",
     active_season: bootstrap?.game_settings?.season || "unknown",
     current_gw: currentEvent ? currentEvent.id : null,
     next_deadline_utc: currentEvent ? currentEvent.deadline_time : null,
     data_timestamp_utc: new Date().toISOString(),
-    source: "official_fpl_api"
+    source: "official_fpl_api",
+
+    // ✅ BUILD FINGERPRINT — proves which commit is live
+    build_sha:
+      process.env.RAILWAY_GIT_COMMIT_SHA ||
+      process.env.GITHUB_SHA ||
+      process.env.COMMIT_SHA ||
+      "unknown",
+    build_time_utc:
+      process.env.BUILD_TIME_UTC ||
+      new Date().toISOString()
   };
 }
 
@@ -133,7 +144,7 @@ function resolvePlayerStrict({ q, elements, teams }) {
   const exact = hits2.find((e) => normalize(e.web_name) === nq);
   const chosen = exact || hits2[0];
 
-  // Ambiguity guard: if multiple very close hits and none exact, force clarification
+  // Ambiguity guard: if multiple close hits and none exact, force clarification
   if (!exact && hits2.length > 1) {
     return {
       ok: false,
@@ -381,7 +392,7 @@ app.post("/rexo", async (req, res) => {
     // ✅ player_check (HARD-GATED) — single name only, returns validated_players
     if (mode === "player_check") {
       // hard rule: do not accept batching
-      if (Array.isArray(req.body?.q)) {
+      if (Array.isArray(req.body?.q) || Array.isArray(req.body?.names) || Array.isArray(req.body?.ids)) {
         return res.status(400).json({
           ok: false,
           error: "BATCH_PLAYER_CHECK_FORBIDDEN"
@@ -441,7 +452,7 @@ app.post("/rexo", async (req, res) => {
       if (!gwUse) {
         return res.status(400).json({
           ok: false,
-          error: "Missing GW context",
+          error: "Missing_GW_Context",
           details: "Provide { gw: <number> } or ensure current_gw is available."
         });
       }
@@ -493,14 +504,14 @@ app.post("/rexo", async (req, res) => {
 
     return res.status(400).json({
       ok: false,
-      error: "Unknown mode",
+      error: "Unknown_mode",
       details: `mode="${mode}" not supported`
     });
   } catch (err) {
     console.error("REXO ERROR:", err);
     return res.status(500).json({
       ok: false,
-      error: "Action failed",
+      error: "Action_failed",
       details: err?.name === "AbortError" ? "Upstream timeout" : err.message
     });
   }
