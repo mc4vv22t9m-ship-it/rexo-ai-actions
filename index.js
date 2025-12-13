@@ -14,7 +14,7 @@ app.get("/health", (req, res) => {
 // MAIN REXO ACTION
 app.post("/rexo", async (req, res) => {
   try {
-    // 1️⃣ Fetch core FPL data
+    // 1️⃣ Fetch core FPL data (official sources)
     const [bootstrapRes, fixturesRes, eventStatusRes] = await Promise.all([
       fetch(`${FPL_BASE}/bootstrap-static/`),
       fetch(`${FPL_BASE}/fixtures/`),
@@ -25,19 +25,20 @@ app.post("/rexo", async (req, res) => {
     const fixtures = await fixturesRes.json();
     const eventStatus = await eventStatusRes.json();
 
-    // 2️⃣ Detect active GW
-    const currentEvent = bootstrap.events.find(e => e.is_current) 
-      || bootstrap.events.find(e => e.is_next);
+    // 2️⃣ Detect active / next Gameweek
+    const currentEvent =
+      bootstrap.events.find(e => e.is_current) ||
+      bootstrap.events.find(e => e.is_next);
 
-    // 3️⃣ Build authoritative response
+    // 3️⃣ Authoritative response (single source of truth)
     return res.json({
       ok: true,
 
       meta: {
         competition: "Fantasy Premier League",
-        active_season: bootstrap.game_settings.season || "unknown",
-        current_gw: currentEvent ? currentEvent.id : null,
-        next_deadline_utc: currentEvent ? currentEvent.deadline_time : null,
+        active_season: bootstrap.game_settings?.season || "unknown",
+        current_gw: currentEvent?.id || null,
+        next_deadline_utc: currentEvent?.deadline_time || null,
         data_timestamp_utc: new Date().toISOString(),
         source: "official_fpl_api"
       },
@@ -59,7 +60,7 @@ app.post("/rexo", async (req, res) => {
     console.error("REXO ACTION ERROR:", error);
     return res.status(500).json({
       ok: false,
-      error: "Failed to fetch live FPL data",
+      error: "FPL_DATA_FETCH_FAILED",
       details: error.message
     });
   }
