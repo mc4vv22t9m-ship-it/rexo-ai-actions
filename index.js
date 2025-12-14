@@ -4,17 +4,29 @@ const app = express();
 app.use(express.json({ limit: "256kb" }));
 
 const FPL_BASE = "https://fantasy.premierleague.com/api";
-// ---------- BUILD FINGERPRINT (authoritative) ----------
-const BUILD_ID = "7a81130";
-const BUILD_TIME_UTC = new Date().toISOString();
-// ---------- tiny in-memory cache (prevents 502/timeouts) ----------
+
+const BUILD_SHA =
+  process.env.RAILWAY_GIT_COMMIT_SHA ||
+  process.env.GITHUB_SHA ||
+  process.env.COMMIT_SHA ||
+  "unknown";
+
+const BUILD_TIME_UTC = process.env.BUILD_TIME_UTC || "unknown";
+
 const CACHE = {
   bootstrap: { ts: 0, data: null },
   fixtures: { ts: 0, data: null }
 };
-const TTL_MS = 60 * 1000; // 60s
 
-/** ---------- helpers ---------- **/
+const TTL_MS = 60 * 1000;
+
+const POS_NAME = new Map([
+  [1, "GK"],
+  [2, "DEF"],
+  [3, "MID"],
+  [4, "FWD"]
+]);
+
 function withTimeout(ms = 8000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
@@ -24,7 +36,6 @@ function withTimeout(ms = 8000) {
 async function fplFetchJson(url, ms = 8000) {
   const t = withTimeout(ms);
   try {
-    // Node 18+ has global fetch. If you’re on older Node, you must install node-fetch.
     const res = await fetch(url, {
       signal: t.signal,
       headers: { "User-Agent": "rexo-actions/1.0" }
@@ -55,40 +66,6 @@ async function getFixtures() {
 const toNum = (v) => (v === null || v === undefined || v === "" ? 0 : Number(v));
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 
-function buildMeta(bootstrap) {
-  const currentEvent =
-    bootstrap.events.find((e) => e.is_current) ||
-    bootstrap.events.find((e) => e.is_next) ||
-    null;
-
-  return {
-    competition: "Fantasy Premier League",
-    active_season: bootstrap?.game_settings?.season || "unknown",
-    current_gw: currentEvent ? currentEvent.id : null,
-    next_deadline_utc: currentEvent ? currentEvent.deadline_time : null,
-    data_timestamp_utc: new Date().toISOString(),
-    source: "official_fpl_api",
-
-    // ✅ BUILD FINGERPRINT — proves which commit is live
-    build_sha:
-      process.env.RAILWAY_GIT_COMMIT_SHA ||
-      process.env.GITHUB_SHA ||
-      process.env.COMMIT_SHA ||
-      "unknown",
-    build_time_utc:
-      process.env.BUILD_TIME_UTC ||
-      new Date().toISOString()
-  };
-}
-
-/** ---------- HARD GATE HELPERS ---------- **/
-const POS_NAME = new Map([
-  [1, "GK"],
-  [2, "DEF"],
-  [3, "MID"],
-  [4, "FWD"]
-]);
-
 function normalize(str) {
   return (str || "")
     .toString()
@@ -110,46 +87,68 @@ function buildTeamMaps(teams) {
   return { byId, shortById, nameById };
 }
 
-/**
- * Strict player resolution: only from current bootstrap.elements
- * q can be: "Bowen" or "Jarrod Bowen – West Ham" etc.
- */
+function buildMeta(bootstrap) {
+  const currentEvent =
+    bootstrap.events.find((e) => e.is_current) ||
+    bootstrap.events.find((e) => e.is_next) ||
+    null;
+
+  return {
+    competition: "Fantasy Premier League",
+    active_season: bootstrap?.game_settings?.season || "unknown",
+    current_gw: currentEvent ? currentEvent.id : null,
+    next_deadline_utc: currentEvent ? currentEvent.deadline_time : null,
+    data_timestamp_utc: new Date().toISOString(),
+    source: "official_fpl_api",
+    build_sha: BUILD_SHA,
+    build_time_utc: BUILD_TIME_UTC
+  };
+}
+
 function resolvePlayerStrict({ q, elements, teams }) {
   const nq = normalize(q);
   if (!nq) return { ok: false, error: "EMPTY_QUERY" };
 
   const { shortById, nameById } = buildTeamMaps(teams);
+  const list = Array.isArray(elements) ? elements : [];
 
-  // Match by web_name first (most stable), then by first+second name contains.
-  const hits = (elements || [])
+  const isShort = nq.length < 4;
+
+  const webMatches = list
     .filter((e) => e && e.web_name)
-    .filter((e) => normalize(e.web_name) === nq || normalize(e.web_name).includes(nq))
+    .filter((e) => {
+      const w = normalize(e.web_name);
+      if (isShort) return w === nq;
+      return w === nq || w.includes(nq);
+    })
     .slice(0, 10);
 
-  // If zero hits, try broader contains on "first_name last_name"
-  const hits2 = hits.length
-    ? hits
-    : (elements || [])
+  const fullMatches = webMatches.length
+    ? webMatches
+    : list
         .filter((e) => e && (e.first_name || e.second_name || e.web_name))
         .filter((e) => {
           const full = normalize(`${e.first_name || ""} ${e.second_name || ""}`.trim());
           const web = normalize(e.web_name || "");
+          if (isShort) return full === nq || web === nq;
           return full === nq || full.includes(nq) || web.includes(nq);
         })
         .slice(0, 10);
 
-  if (!hits2.length) return { ok: false, error: "NOT_FOUND" };
+  if (!fullMatches.length) return { ok: false, error: "NOT_FOUND" };
 
-  // Prefer exact match if exists
-  const exact = hits2.find((e) => normalize(e.web_name) === nq);
-  const chosen = exact || hits2[0];
+  const exactWeb = fullMatches.find((e) => normalize(e.web_name) === nq);
+  const exactFull = fullMatches.find(
+    (e) => normalize(`${e.first_name || ""} ${e.second_name || ""}`.trim()) === nq
+  );
 
-  // Ambiguity guard: if multiple close hits and none exact, force clarification
-  if (!exact && hits2.length > 1) {
+  const chosen = exactWeb || exactFull || fullMatches[0];
+
+  if (!exactWeb && !exactFull && fullMatches.length > 1) {
     return {
       ok: false,
       error: "AMBIGUOUS",
-      candidates: hits2.slice(0, 5).map((e) => ({
+      candidates: fullMatches.slice(0, 5).map((e) => ({
         id: e.id,
         name: e.web_name,
         team: shortById.get(e.team) || e.team
@@ -176,7 +175,6 @@ function resolvePlayerStrict({ q, elements, teams }) {
   };
 }
 
-/** Simple GW opponent strength adjustment (lightweight). */
 function fixtureAdjForElement(element, teamById, gwFixtures) {
   const teamId = element.team;
   const relevant = gwFixtures.filter((f) => f.team_h === teamId || f.team_a === teamId);
@@ -192,7 +190,6 @@ function fixtureAdjForElement(element, teamById, gwFixtures) {
     const oppDef = isHome ? opp.strength_defence_away : opp.strength_defence_home;
     const oppAtt = isHome ? opp.strength_attack_away : opp.strength_attack_home;
 
-    // map strength 1..5 -> 1.12..0.88
     const map = (s) => 1.12 - (clamp(toNum(s), 1, 5) - 1) * (0.24 / 4);
 
     let m = 1.0;
@@ -211,18 +208,15 @@ function scoreElement(element, adjMult) {
   const form = toNum(element.form);
   const ppg = toNum(element.points_per_game);
   const mins = toNum(element.minutes);
-
   const minutesReliability = clamp(mins / 900, 0, 1);
   const base = form * 2.2 + ppg * 1.6 + minutesReliability * 2.0;
-
   return base * adjMult;
 }
 
-/** Greedy 15-man FH draft under constraints */
 function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 3 }) {
   const teamById = new Map(teams.map((t) => [t.id, t]));
 
-  const enriched = elements
+  const enriched = (elements || [])
     .filter((e) => e.status === "a")
     .map((e) => {
       const adj = fixtureAdjForElement(e, teamById, gwFixtures);
@@ -240,10 +234,7 @@ function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 
   const sortValue = (arr) =>
     arr
       .slice()
-      .sort(
-        (a, b) =>
-          b.__score / b.now_cost - a.__score / a.now_cost || b.__score - a.__score
-      );
+      .sort((a, b) => b.__score / b.now_cost - a.__score / a.now_cost || b.__score - a.__score);
 
   const pools = {
     1: sortValue(byPos[1]),
@@ -263,6 +254,7 @@ function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 
     if (spent + p.now_cost > budget) return false;
     return true;
   }
+
   function add(p) {
     picks.push(p);
     spent += p.now_cost;
@@ -342,8 +334,13 @@ function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 
   };
 }
 
-/** ---------- routes ---------- **/
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    build_sha: BUILD_SHA,
+    build_time_utc: BUILD_TIME_UTC
+  });
+});
 
 app.post("/rexo", async (req, res) => {
   try {
@@ -353,7 +350,6 @@ app.post("/rexo", async (req, res) => {
     const bootstrap = await getBootstrap();
     const meta = buildMeta(bootstrap);
 
-    // common lookups
     const teams = bootstrap.teams || [];
     const { shortById: teamShortById, nameById: teamNameById } = buildTeamMaps(teams);
 
@@ -389,14 +385,13 @@ app.post("/rexo", async (req, res) => {
       return res.json({ ok: true, meta, result: { metric, limit, players: sorted } });
     }
 
-    // ✅ player_check (HARD-GATED) — single name only, returns validated_players
     if (mode === "player_check") {
-      // hard rule: do not accept batching
-      if (Array.isArray(req.body?.q) || Array.isArray(req.body?.names) || Array.isArray(req.body?.ids)) {
-        return res.status(400).json({
-          ok: false,
-          error: "BATCH_PLAYER_CHECK_FORBIDDEN"
-        });
+      if (
+        Array.isArray(req.body?.q) ||
+        Array.isArray(req.body?.names) ||
+        Array.isArray(req.body?.ids)
+      ) {
+        return res.status(400).json({ ok: false, error: "BATCH_PLAYER_CHECK_FORBIDDEN" });
       }
 
       const q = req.body?.q;
@@ -405,7 +400,6 @@ app.post("/rexo", async (req, res) => {
       const elements = bootstrap.elements || [];
       const resolved = resolvePlayerStrict({ q, elements, teams });
 
-      // hard gate: no partials, no guesses
       if (!resolved.ok) {
         return res.status(400).json({
           ok: false,
@@ -467,7 +461,6 @@ app.post("/rexo", async (req, res) => {
         teamLimit
       });
 
-      // Slim picked details for ONLY selected players
       const idSet = new Set(draft.picks);
       const pickedDetails = (bootstrap.elements || [])
         .filter((e) => idSet.has(e.id))
@@ -497,7 +490,7 @@ app.post("/rexo", async (req, res) => {
           picked: pickedDetails
         },
         warnings: [
-          "FH draft is heuristic (form/ppg/minutes + opponent strength). xG/xA needs external stats feeds."
+          "FH draft is heuristic (form/ppg/minutes + opponent strength). xG/xA requires an external stats feed."
         ]
       });
     }
