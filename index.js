@@ -11,7 +11,10 @@ const BUILD_SHA =
   process.env.COMMIT_SHA ||
   "unknown";
 
-const BUILD_TIME_UTC = process.env.BUILD_TIME_UTC || "unknown";
+const BUILD_TIME_UTC =
+  process.env.BUILD_TIME_UTC ||
+  process.env.RAILWAY_DEPLOYMENT_CREATED_AT ||
+  new Date().toISOString();
 
 const CACHE = {
   bootstrap: { ts: 0, data: null },
