@@ -1,9 +1,12 @@
 import express from "express";
 
 const app = express();
-app.use(express.json({ limit: "256kb" }));
 
-const FPL_BASE = "https://fantasy.premierleague.com/api";
+/** -------------------------
+ *  Config
+ *  ------------------------- */
+const FPL_BASE = process.env.FPL_BASE || "https://fantasy.premierleague.com/api";
+const PORT = Number(process.env.PORT || 3000);
 
 const BUILD_SHA =
   process.env.RAILWAY_GIT_COMMIT_SHA ||
@@ -16,12 +19,30 @@ const BUILD_TIME_UTC =
   process.env.RAILWAY_DEPLOYMENT_CREATED_AT ||
   new Date().toISOString();
 
+const JSON_LIMIT = process.env.JSON_LIMIT || "256kb";
+
+/**
+ * Cache strategy:
+ * - TTL = fresh
+ * - stale fallback if upstream fails (prevents cascading failures in GPT Actions)
+ */
+const TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000);
+const STALE_MAX_MS = Number(process.env.CACHE_STALE_MAX_MS || 10 * 60_000); // 10 minutes
+
 const CACHE = {
   bootstrap: { ts: 0, data: null },
   fixtures: { ts: 0, data: null }
 };
 
-const TTL_MS = 60 * 1000;
+const MODE = Object.freeze({
+  meta: "meta",
+  player_check: "player_check",
+  fixtures: "fixtures",
+  top_players: "top_players",
+  fh_draft: "fh_draft"
+});
+
+const TOP_METRICS = new Set(["form", "points_per_game", "selected_by_percent", "minutes"]);
 
 const POS_NAME = new Map([
   [1, "GK"],
@@ -30,44 +51,35 @@ const POS_NAME = new Map([
   [4, "FWD"]
 ]);
 
-function withTimeout(ms = 8000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
-  return { signal: controller.signal, cancel: () => clearTimeout(id) };
-}
+/** -------------------------
+ *  Middleware
+ *  ------------------------- */
+app.set("trust proxy", 1);
+app.use(express.json({ limit: JSON_LIMIT }));
 
-async function fplFetchJson(url, ms = 8000) {
-  const t = withTimeout(ms);
-  try {
-    const res = await fetch(url, {
-      signal: t.signal,
-      headers: { "User-Agent": "rexo-actions/1.0" }
-    });
-    if (!res.ok) throw new Error(`FPL ${res.status} for ${url}`);
-    return await res.json();
-  } finally {
-    t.cancel();
-  }
-}
+// Basic security headers (no extra deps)
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 
-async function getBootstrap() {
-  const now = Date.now();
-  if (CACHE.bootstrap.data && now - CACHE.bootstrap.ts < TTL_MS) return CACHE.bootstrap.data;
-  const data = await fplFetchJson(`${FPL_BASE}/bootstrap-static/`, 9000);
-  CACHE.bootstrap = { ts: now, data };
-  return data;
-}
+// Request id
+app.use((req, res, next) => {
+  const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  req._rid = rid;
+  res.setHeader("X-Request-Id", rid);
+  next();
+});
 
-async function getFixtures() {
-  const now = Date.now();
-  if (CACHE.fixtures.data && now - CACHE.fixtures.ts < TTL_MS) return CACHE.fixtures.data;
-  const data = await fplFetchJson(`${FPL_BASE}/fixtures/`, 9000);
-  CACHE.fixtures = { ts: now, data };
-  return data;
-}
-
+/** -------------------------
+ *  Helpers
+ *  ------------------------- */
 const toNum = (v) => (v === null || v === undefined || v === "" ? 0 : Number(v));
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const isInt = (n) => Number.isInteger(n);
 
 function normalize(str) {
   return (str || "")
@@ -75,6 +87,50 @@ function normalize(str) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ");
+}
+
+function withTimeout(ms = 8000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(id) };
+}
+
+async function fplFetchJson(url, ms = 9000, retries = 1) {
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const t = withTimeout(ms);
+    try {
+      const res = await fetch(url, {
+        signal: t.signal,
+        headers: { "User-Agent": "rexo-actions/1.2" }
+      });
+
+      if (!res.ok) {
+        // Retry only on 5xx
+        if (res.status >= 500 && attempt < retries) {
+          lastErr = new Error(`FPL ${res.status} for ${url}`);
+          continue;
+        }
+        throw new Error(`FPL ${res.status} for ${url}`);
+      }
+
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      // Retry only on AbortError / network-ish errors
+      const retriable =
+        e?.name === "AbortError" ||
+        (typeof e?.message === "string" && e.message.toLowerCase().includes("fetch"));
+
+      if (attempt < retries && retriable) continue;
+      throw lastErr;
+    } finally {
+      t.cancel();
+    }
+  }
+
+  throw lastErr || new Error("Unknown fetch failure");
 }
 
 function buildTeamMaps(teams) {
@@ -91,10 +147,8 @@ function buildTeamMaps(teams) {
 }
 
 function buildMeta(bootstrap) {
-  const currentEvent =
-    bootstrap.events.find((e) => e.is_current) ||
-    bootstrap.events.find((e) => e.is_next) ||
-    null;
+  const events = Array.isArray(bootstrap?.events) ? bootstrap.events : [];
+  const currentEvent = events.find((e) => e.is_current) || events.find((e) => e.is_next) || null;
 
   return {
     competition: "Fantasy Premier League",
@@ -108,13 +162,101 @@ function buildMeta(bootstrap) {
   };
 }
 
+/**
+ * Cache getters with stale fallback
+ */
+async function getBootstrap() {
+  const now = Date.now();
+  const fresh = CACHE.bootstrap.data && now - CACHE.bootstrap.ts < TTL_MS;
+  if (fresh) return { data: CACHE.bootstrap.data, stale: false };
+
+  try {
+    const data = await fplFetchJson(`${FPL_BASE}/bootstrap-static/`, 9000, 1);
+    CACHE.bootstrap = { ts: now, data };
+    return { data, stale: false };
+  } catch (e) {
+    const hasStale = CACHE.bootstrap.data && now - CACHE.bootstrap.ts < STALE_MAX_MS;
+    if (hasStale) return { data: CACHE.bootstrap.data, stale: true, warning: "bootstrap_stale" };
+    throw e;
+  }
+}
+
+async function getFixtures() {
+  const now = Date.now();
+  const fresh = CACHE.fixtures.data && now - CACHE.fixtures.ts < TTL_MS;
+  if (fresh) return { data: CACHE.fixtures.data, stale: false };
+
+  try {
+    const data = await fplFetchJson(`${FPL_BASE}/fixtures/`, 9000, 1);
+    CACHE.fixtures = { ts: now, data };
+    return { data, stale: false };
+  } catch (e) {
+    const hasStale = CACHE.fixtures.data && now - CACHE.fixtures.ts < STALE_MAX_MS;
+    if (hasStale) return { data: CACHE.fixtures.data, stale: true, warning: "fixtures_stale" };
+    throw e;
+  }
+}
+
+function ok(res, payload) {
+  return res.status(200).json({ ok: true, ...payload });
+}
+
+function badRequest(res, error, details, extra = {}) {
+  return res.status(400).json({ ok: false, error, ...(details ? { details } : {}), ...extra });
+}
+
+function serverError(res, err) {
+  const details =
+    err?.name === "AbortError"
+      ? "Upstream timeout"
+      : typeof err?.message === "string"
+      ? err.message
+      : "Unknown error";
+
+  return res.status(500).json({ ok: false, error: "Action_failed", details });
+}
+
+function validateMode(v) {
+  const m = String(v || MODE.meta);
+  if (!Object.values(MODE).includes(m)) return null;
+  return m;
+}
+
+function parseGW(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  if (!isInt(n)) return null;
+  if (n < 1 || n > 60) return null;
+  return n;
+}
+
+function parseLimit(v, def = 10, min = 1, max = 30) {
+  const n = v === null || v === undefined || v === "" ? def : Number(v);
+  if (!Number.isFinite(n)) return def;
+  return clamp(Math.floor(n), min, max);
+}
+
+function parseBudget(v, def = 1000) {
+  const n = v === null || v === undefined || v === "" ? def : Number(v);
+  if (!Number.isFinite(n)) return def;
+  return clamp(Math.floor(n), 0, 2000);
+}
+
+function parseTeamLimit(v, def = 3) {
+  const n = v === null || v === undefined || v === "" ? def : Number(v);
+  if (!Number.isFinite(n)) return def;
+  return clamp(Math.floor(n), 1, 3);
+}
+
+/** -------------------------
+ *  Player resolving
+ *  ------------------------- */
 function resolvePlayerStrict({ q, elements, teams }) {
   const nq = normalize(q);
   if (!nq) return { ok: false, error: "EMPTY_QUERY" };
 
   const { shortById, nameById } = buildTeamMaps(teams);
   const list = Array.isArray(elements) ? elements : [];
-
   const isShort = nq.length < 4;
 
   const webMatches = list
@@ -154,7 +296,7 @@ function resolvePlayerStrict({ q, elements, teams }) {
       candidates: fullMatches.slice(0, 5).map((e) => ({
         id: e.id,
         name: e.web_name,
-        team: shortById.get(e.team) || e.team
+        team: shortById.get(e.team) || String(e.team)
       }))
     };
   }
@@ -164,26 +306,31 @@ function resolvePlayerStrict({ q, elements, teams }) {
     player: {
       id: chosen.id,
       name: chosen.web_name,
-      team: shortById.get(chosen.team) || chosen.team,
-      team_full: nameById.get(chosen.team) || chosen.team,
+      team: shortById.get(chosen.team) || String(chosen.team),
+      team_full: nameById.get(chosen.team) || String(chosen.team),
       element_type: chosen.element_type,
-      position: POS_NAME.get(chosen.element_type) || chosen.element_type,
+      position: POS_NAME.get(chosen.element_type) || String(chosen.element_type),
       cost: chosen.now_cost,
       status: chosen.status,
       form: chosen.form,
       selected_by_percent: chosen.selected_by_percent,
+      points_per_game: chosen.points_per_game,
       minutes: chosen.minutes,
       chance_of_playing_next_round: chosen.chance_of_playing_next_round
     }
   };
 }
 
+/** -------------------------
+ *  FH Draft scoring
+ *  ------------------------- */
 function fixtureAdjForElement(element, teamById, gwFixtures) {
   const teamId = element.team;
   const relevant = gwFixtures.filter((f) => f.team_h === teamId || f.team_a === teamId);
   if (relevant.length === 0) return 1.0;
 
   let multSum = 0;
+
   for (const fx of relevant) {
     const isHome = fx.team_h === teamId;
     const oppId = isHome ? fx.team_a : fx.team_h;
@@ -196,11 +343,9 @@ function fixtureAdjForElement(element, teamById, gwFixtures) {
     const map = (s) => 1.12 - (clamp(toNum(s), 1, 5) - 1) * (0.24 / 4);
 
     let m = 1.0;
-    if (element.element_type === 1 || element.element_type === 2) {
-      m = map(oppAtt);
-    } else {
-      m = map(oppDef);
-    }
+    if (element.element_type === 1 || element.element_type === 2) m = map(oppAtt);
+    else m = map(oppDef);
+
     multSum += m;
   }
 
@@ -217,7 +362,7 @@ function scoreElement(element, adjMult) {
 }
 
 function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 3 }) {
-  const teamById = new Map(teams.map((t) => [t.id, t]));
+  const teamById = new Map((teams || []).map((t) => [t.id, t]));
 
   const enriched = (elements || [])
     .filter((e) => e.status === "a")
@@ -264,6 +409,7 @@ function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 
     teamCount.set(p.team, (teamCount.get(p.team) || 0) + 1);
   }
 
+  // Fill by best value first
   for (const pos of [1, 2, 3, 4]) {
     let i = 0;
     while (picks.filter((x) => x.element_type === pos).length < needed[pos]) {
@@ -274,6 +420,7 @@ function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 
     }
   }
 
+  // Fallback: cheapest to complete
   const cheapestByPos = {
     1: byPos[1].slice().sort((a, b) => a.now_cost - b.now_cost),
     2: byPos[2].slice().sort((a, b) => a.now_cost - b.now_cost),
@@ -337,6 +484,9 @@ function buildFHDraft({ elements, teams, gwFixtures, budget = 1000, teamLimit = 
   };
 }
 
+/** -------------------------
+ *  Routes
+ *  ------------------------- */
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -347,171 +497,204 @@ app.get("/health", (req, res) => {
 
 app.post("/rexo", async (req, res) => {
   try {
-    const mode = String(req.body?.mode || "meta");
-    const gw = req.body?.gw ? Number(req.body.gw) : null;
-
-    const bootstrap = await getBootstrap();
-    const meta = buildMeta(bootstrap);
-
-    const teams = bootstrap.teams || [];
-    const { shortById: teamShortById, nameById: teamNameById } = buildTeamMaps(teams);
-
-    if (mode === "meta") {
-      return res.json({ ok: true, meta });
+    const mode = validateMode(req.body?.mode);
+    if (!mode) {
+      return badRequest(
+        res,
+        "Invalid_mode",
+        "mode must be one of: meta, player_check, fixtures, top_players, fh_draft"
+      );
     }
 
-    if (mode === "top_players") {
-      const metric = String(req.body?.metric || "form");
-      const limit = clamp(Number(req.body?.limit || 10), 1, 30);
+    const gw = parseGW(req.body?.gw);
 
-      const elements = bootstrap.elements || [];
+    // Always load bootstrap first
+    const boot = await getBootstrap();
+    const bootstrap = boot.data;
+    const meta = buildMeta(bootstrap);
+
+    const warnings = [];
+    if (boot.stale) warnings.push(boot.warning);
+
+    const teams = Array.isArray(bootstrap?.teams) ? bootstrap.teams : [];
+    const elements = Array.isArray(bootstrap?.elements) ? bootstrap.elements : [];
+    const { shortById: teamShortById, nameById: teamNameById, byId: teamById } = buildTeamMaps(teams);
+
+    // IMPORTANT: return mode in all OK responses (matches OpenAPI 1.2.0)
+    if (mode === MODE.meta) {
+      return ok(res, { mode, meta, ...(warnings.length ? { warnings } : {}) });
+    }
+
+    if (mode === MODE.top_players) {
+      const metric = String(req.body?.metric || "form");
+      if (!TOP_METRICS.has(metric)) {
+        return badRequest(res, "Invalid_metric", `metric must be one of: ${Array.from(TOP_METRICS).join(", ")}`);
+      }
+      const limit = parseLimit(req.body?.limit, 10, 1, 30);
+
       const sorted = elements
-        .filter((e) => e.status === "a")
+        .filter((e) => e && e.status === "a")
+        .slice()
         .sort((a, b) => toNum(b[metric]) - toNum(a[metric]))
         .slice(0, limit)
         .map((e) => ({
           id: e.id,
           name: e.web_name,
-          team: teamShortById.get(e.team) || e.team,
-          team_full: teamNameById.get(e.team) || e.team,
+          team: teamShortById.get(e.team) || String(e.team),
+          team_full: teamNameById.get(e.team) || String(e.team),
           element_type: e.element_type,
           position: POS_NAME.get(e.element_type) || String(e.element_type),
           cost: e.now_cost,
+          status: e.status,
           form: e.form,
           selected_by_percent: e.selected_by_percent,
           points_per_game: e.points_per_game,
           minutes: e.minutes,
-          status: e.status,
           chance_of_playing_next_round: e.chance_of_playing_next_round
         }));
 
-      return res.json({ ok: true, meta, result: { metric, limit, players: sorted } });
+      return ok(res, {
+        mode,
+        meta,
+        result: { metric, limit, players: sorted },
+        ...(warnings.length ? { warnings } : {})
+      });
     }
 
-    if (mode === "player_check") {
-      if (
-        Array.isArray(req.body?.q) ||
-        Array.isArray(req.body?.names) ||
-        Array.isArray(req.body?.ids)
-      ) {
-        return res.status(400).json({ ok: false, error: "BATCH_PLAYER_CHECK_FORBIDDEN" });
+    if (mode === MODE.player_check) {
+      if (Array.isArray(req.body?.q) || Array.isArray(req.body?.names) || Array.isArray(req.body?.ids)) {
+        return badRequest(res, "BATCH_PLAYER_CHECK_FORBIDDEN", "Use a single string q. Batch not supported.");
       }
 
-      const q = req.body?.q;
-      const limit = clamp(Number(req.body?.limit || 5), 1, 10);
+      const q = typeof req.body?.q === "string" ? req.body.q : "";
+      const limit = parseLimit(req.body?.limit, 5, 1, 10);
 
-      const elements = bootstrap.elements || [];
       const resolved = resolvePlayerStrict({ q, elements, teams });
 
       if (!resolved.ok) {
-        return res.status(400).json({
-          ok: false,
-          error: resolved.error,
-          ...(resolved.candidates ? { candidates: resolved.candidates } : {})
-        });
+        if (resolved.error === "AMBIGUOUS") {
+          return badRequest(res, "AMBIGUOUS", "Provide full name.", { candidates: resolved.candidates || [] });
+        }
+        return badRequest(res, resolved.error, resolved.error === "NOT_FOUND" ? "No matching player." : "Invalid query.");
       }
 
       const validated_players = [resolved.player];
 
-      return res.json({
-        ok: true,
+      return ok(res, {
+        mode,
         meta,
         validated_players,
-        result: { mode: "player_check", hits: validated_players.slice(0, limit) }
+        result: { mode: "player_check", hits: validated_players.slice(0, limit) },
+        ...(warnings.length ? { warnings } : {})
       });
     }
 
-    if (mode === "fixtures") {
-      const fixtures = await getFixtures();
+    if (mode === MODE.fixtures) {
+      const fx = await getFixtures();
+      const fixtures = Array.isArray(fx.data) ? fx.data : [];
+      if (fx.stale) warnings.push(fx.warning);
+
       const out = gw ? fixtures.filter((f) => f.event === gw) : fixtures;
-      return res.json({
-        ok: true,
+
+      // Enrich with team names (useful for schedule summaries)
+      const mapped = out.map((f) => ({
+        id: f.id,
+        event: f.event ?? null,
+        team_h: f.team_h,
+        team_a: f.team_a,
+        team_h_name: teamNameById.get(f.team_h) || String(f.team_h),
+        team_a_name: teamNameById.get(f.team_a) || String(f.team_a),
+        kickoff_time: f.kickoff_time ?? null
+      }));
+
+      return ok(res, {
+        mode,
         meta,
         result: {
           gw: gw || null,
-          fixtures: out.map((f) => ({
-            id: f.id,
-            event: f.event,
-            team_h: f.team_h,
-            team_a: f.team_a,
-            kickoff_time: f.kickoff_time
-          }))
-        }
+          available: gw ? mapped.length > 0 : true,
+          count: mapped.length,
+          fixtures: mapped
+        },
+        ...(warnings.length ? { warnings } : {})
       });
     }
 
-    if (mode === "fh_draft") {
-      const fixtures = await getFixtures();
-      const budget = req.body?.budget ? Number(req.body.budget) : 1000;
-      const teamLimit = req.body?.team_limit ? Number(req.body.team_limit) : 3;
+    if (mode === MODE.fh_draft) {
+      const fx = await getFixtures();
+      const fixtures = Array.isArray(fx.data) ? fx.data : [];
+      if (fx.stale) warnings.push(fx.warning);
+
+      const budget = parseBudget(req.body?.budget, 1000);
+      const teamLimit = parseTeamLimit(req.body?.team_limit, 3);
 
       const gwUse = gw || meta.current_gw || null;
       if (!gwUse) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing_GW_Context",
-          details: "Provide { gw: <number> } or ensure current_gw is available."
-        });
+        return badRequest(res, "Missing_GW_Context", "Provide { gw: <number> } or ensure current_gw is available.");
       }
 
       const gwFixtures = fixtures.filter((f) => f.event === gwUse);
 
       const draft = buildFHDraft({
-        elements: bootstrap.elements || [],
-        teams: bootstrap.teams || [],
+        elements,
+        teams,
         gwFixtures,
         budget,
         teamLimit
       });
 
       const idSet = new Set(draft.picks);
-      const pickedDetails = (bootstrap.elements || [])
+      const pickedDetails = elements
         .filter((e) => idSet.has(e.id))
         .map((e) => ({
           id: e.id,
           name: e.web_name,
-          team: teamShortById.get(e.team) || e.team,
-          team_full: teamNameById.get(e.team) || e.team,
+          team: teamShortById.get(e.team) || String(e.team),
+          team_full: teamNameById.get(e.team) || String(e.team),
           element_type: e.element_type,
           position: POS_NAME.get(e.element_type) || String(e.element_type),
           cost: e.now_cost,
-          form: e.form,
-          ppg: e.points_per_game,
-          minutes: e.minutes,
           status: e.status,
+          form: e.form,
+          selected_by_percent: e.selected_by_percent,
+          points_per_game: e.points_per_game,
+          minutes: e.minutes,
           chance_of_playing_next_round: e.chance_of_playing_next_round
         }))
-        .sort((a, b) => toNum(b.ppg) - toNum(a.ppg));
+        .sort((a, b) => toNum(b.points_per_game) - toNum(a.points_per_game));
 
-      return res.json({
-        ok: true,
+      return ok(res, {
+        mode,
         meta,
-        result: {
-          mode: "fh_draft",
-          gw: gwUse,
-          draft,
-          picked: pickedDetails
-        },
+        result: { mode: "fh_draft", gw: gwUse, draft, picked: pickedDetails },
         warnings: [
-          "FH draft is heuristic (form/ppg/minutes + opponent strength). xG/xA requires an external stats feed."
+          ...(warnings.length ? warnings : []),
+          "FH draft is heuristic (form/ppg/minutes + opponent strength from FPL team strengths)."
         ]
       });
     }
 
-    return res.status(400).json({
-      ok: false,
-      error: "Unknown_mode",
-      details: `mode="${mode}" not supported`
-    });
+    return badRequest(res, "Unknown_mode", `mode="${mode}" not supported`);
   } catch (err) {
     console.error("REXO ERROR:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Action_failed",
-      details: err?.name === "AbortError" ? "Upstream timeout" : err.message
-    });
+    return serverError(res, err);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`REXO Actions running on :${PORT}`));
+/** -------------------------
+ *  Server + graceful shutdown
+ *  ------------------------- */
+const server = app.listen(PORT, () => {
+  console.log(`REXO Actions running on :${PORT} (sha=${BUILD_SHA})`);
+});
+
+function shutdown(signal) {
+  console.log(`Shutdown: ${signal}`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("unhandledRejection", (err) => console.error("UnhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("UncaughtException:", err));
