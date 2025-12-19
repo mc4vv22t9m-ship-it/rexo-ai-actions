@@ -1,8 +1,13 @@
 openapi: 3.1.0
+
 info:
-  title: REXO Actions (Elite)
-  version: 1.0.0
-  description: Single action endpoint that returns live FPL context + dataset bundle for Elite decisions.
+  title: REXO Actions
+  version: 1.4.1
+  description: >
+    Read-only JSON gateway to official Fantasy Premier League data.
+    Single endpoint (/rexo) with strict mode switching.
+    Designed for deterministic GPT Actions usage. No writes.
+
 servers:
   - url: https://rexo-ai-actions-production.up.railway.app
 
@@ -17,137 +22,299 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  ok:
-                    type: boolean
-                required: [ok]
+                $ref: "#/components/schemas/HealthResponse"
 
   /rexo:
     post:
       operationId: rexo
-      summary: Fetch live season context + data bundle for Elite FPL decisions
+      summary: Execute an action mode and return official FPL-derived JSON
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                intent:
-                  type: string
-                  description: What the user wants to do.
-                  enum:
-                    - squad_review
-                    - transfers
-                    - captaincy
-                    - lineup
-                    - chip_strategy
-                    - price_watch
-                    - wildcard_draft
-                    - general
-                squad:
-                  type: object
-                  description: Optional user squad context (use if available).
-                  properties:
-                    players:
-                      type: array
-                      description: 15 player IDs (FPL element IDs) if known.
-                      items:
-                        type: integer
-                    itb:
-                      type: number
-                      description: Money in the bank
-                    free_transfers:
-                      type: integer
-                    chips_available:
-                      type: array
-                      items:
-                        type: string
-                    target_gw:
-                      type: integer
-                  additionalProperties: false
-                players_of_interest:
-                  type: array
-                  description: Optional list of FPL element IDs to enrich with per-player data (summary).
-                  items:
-                    type: integer
-                horizon_gws:
-                  type: integer
-                  description: How many upcoming GWs to include in fixtures slice.
-                  minimum: 1
-                  maximum: 12
-                  default: 6
-              required: [intent]
-              additionalProperties: false
+              $ref: "#/components/schemas/RexoRequest"
+            examples:
+              meta:
+                value:
+                  mode: meta
+              fixtures_gw:
+                value:
+                  mode: fixtures
+                  gw: 17
+              top_players_form:
+                value:
+                  mode: top_players
+                  metric: form
+                  limit: 10
+              top_players_transfers_in_event:
+                value:
+                  mode: top_players
+                  metric: transfers_in_event
+                  limit: 10
+              player_check:
+                value:
+                  mode: player_check
+                  q: Bukayo Saka
+              market_scan_gw:
+                value:
+                  mode: market_scan
+                  gw: 17
+                  limit: 15
+              fh_draft:
+                value:
+                  mode: fh_draft
+                  gw: 17
+                  budget: 1000
+                  team_limit: 3
+              snapshot:
+                value:
+                  mode: snapshot
+                  gw: 17
+
       responses:
         "200":
-          description: Live season context + data bundle
+          description: Successful response
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  ok:
-                    type: boolean
-
-                  meta:
-                    type: object
-                    description: Authoritative live context. MUST be present for Elite to answer.
-                    properties:
-                      active_season:
-                        type: string
-                        description: e.g. "2025/26"
-                      current_gw:
-                        type: integer
-                      next_deadline_utc:
-                        type: string
-                        format: date-time
-                      data_timestamp_utc:
-                        type: string
-                        format: date-time
-                      source:
-                        type: string
-                        description: Source label, e.g. "official_fpl"
-                    required: [active_season, current_gw, next_deadline_utc, data_timestamp_utc]
-
-                  fpl:
-                    type: object
-                    description: Core FPL dataset bundle used by Elite.
-                    properties:
-                      bootstrap:
-                        type: object
-                        description: Official FPL bootstrap-static payload (or a reduced subset).
-                      fixtures:
-                        type: array
-                        description: Upcoming fixtures slice (size depends on horizon_gws).
-                        items:
-                          type: object
-                      event_status:
-                        type: object
-                        description: Official FPL event-status payload.
-                      element_summaries:
-                        type: object
-                        description: Map of elementId -> official element-summary payload (only for players_of_interest).
-                        additionalProperties:
-                          type: object
-                    required: [bootstrap, fixtures, event_status]
-
-                  warnings:
-                    type: array
-                    items:
-                      type: string
-
-                required: [ok, meta, fpl]
+                $ref: "#/components/schemas/RexoOkResponse"
         "400":
-          description: Bad request
+          description: Validation error
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  ok:
-                    type: boolean
-                  error:
-                    type: string
-                required: [ok, error]
+                $ref: "#/components/schemas/RexoErrorResponse"
+        "500":
+          description: Server or upstream error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RexoErrorResponse"
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, build_sha, build_time_utc]
+      properties:
+        ok:
+          type: boolean
+        build_sha:
+          type: string
+        build_time_utc:
+          type: string
+
+    RexoRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum:
+            - meta
+            - fixtures
+            - top_players
+            - player_check
+            - market_scan
+            - fh_draft
+            - snapshot
+          description: Execution mode
+        gw:
+          type: integer
+          minimum: 1
+          maximum: 60
+          description: Target gameweek (fixtures, market_scan, fh_draft, snapshot)
+        metric:
+          type: string
+          enum:
+            - form
+            - points_per_game
+            - selected_by_percent
+            - minutes
+            - transfers_in_event
+            - transfers_out_event
+          description: Metric for top_players (includes ownership & transfer-momentum)
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 30
+          description: Result limit (top_players, market_scan)
+        q:
+          type: string
+          description: Player name query (player_check)
+        budget:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: Budget in tenths (default 1000 = 100.0)
+        team_limit:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: Max players per club (default 3)
+
+        # snapshot mode optional inputs (if you support them)
+        metrics:
+          type: array
+          items:
+            type: string
+          description: Optional metrics list for snapshot top_players block
+        names:
+          type: array
+          items:
+            type: string
+          description: Optional player names list for snapshot player_check block
+
+    Meta:
+      type: object
+      required:
+        - competition
+        - active_season
+        - current_gw
+        - next_gw
+        - next_deadline_utc
+        - data_timestamp_utc
+        - source
+        - build_sha
+        - build_time_utc
+      properties:
+        competition:
+          type: string
+        active_season:
+          type: string
+        current_gw:
+          type: integer
+          nullable: true
+        next_gw:
+          type: integer
+          nullable: true
+        next_deadline_utc:
+          type: string
+          nullable: true
+        data_timestamp_utc:
+          type: string
+        source:
+          type: string
+        build_sha:
+          type: string
+        build_time_utc:
+          type: string
+
+    Player:
+      type: object
+      required:
+        - id
+        - name
+        - team
+        - team_full
+        - element_type
+        - position
+        - cost
+        - status
+        - form
+        - selected_by_percent
+        - points_per_game
+        - minutes
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        team:
+          type: string
+        team_full:
+          type: string
+        element_type:
+          type: integer
+        position:
+          type: string
+        cost:
+          type: integer
+          description: Player price in tenths (e.g., 103 = 10.3)
+        status:
+          type: string
+          description: Availability flag (e.g., a/d/i/s/u)
+        form:
+          type: string
+        selected_by_percent:
+          type: string
+        points_per_game:
+          type: string
+        minutes:
+          type: integer
+        chance_of_playing_next_round:
+          type: integer
+          nullable: true
+        transfers_in_event:
+          type: integer
+          nullable: true
+          description: Transfers IN during current GW window (official)
+        transfers_out_event:
+          type: integer
+          nullable: true
+          description: Transfers OUT during current GW window (official)
+
+    MarketScanItem:
+      type: object
+      additionalProperties: false
+      required:
+        - player
+        - direction
+        - net_transfers_event
+      properties:
+        player:
+          $ref: "#/components/schemas/Player"
+        direction:
+          type: string
+          enum: [in, out]
+        net_transfers_event:
+          type: integer
+          description: transfers_in_event - transfers_out_event
+
+    RexoOkResponse:
+      type: object
+      required: [ok, mode, meta]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        mode:
+          type: string
+        meta:
+          $ref: "#/components/schemas/Meta"
+        result:
+          type: object
+          additionalProperties: true
+          description: Mode-specific payload
+        validated_players:
+          type: array
+          items:
+            $ref: "#/components/schemas/Player"
+        market:
+          type: array
+          items:
+            $ref: "#/components/schemas/MarketScanItem"
+        warnings:
+          type: array
+          items:
+            type: string
+
+    RexoErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+        details:
+          type: string
+        candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
